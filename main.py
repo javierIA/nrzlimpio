@@ -2,80 +2,11 @@ import time
 import tensorflow as tf
 import cv2
 import numpy as np
-from skimage import measure  ##Calcule el índice de similitud estructural medio entre dos imágenes.
-import cvsdata
 import argparse
-
-
-
-def show_window():
-    num = 0
-
-    for (x, y, window) in sliding_window(resized, 5, (wind_row, wind_col)):
-        if window.shape[0] != wind_row or window.shape[1] != wind_col:
-            continue
-        clone = resized.copy()
-        cv2.rectangle(clone, (x, y), (x + wind_row, y + wind_col), (0, 500, 0), 2)
-
-        t_img = resized[y:y + wind_row, x:x + wind_col]  # the image which has to be predicted
-        # expanding the dimensions of the image to meet the dimensions of the trained model
-
-        ##input_data =np.array(test_img, dtype=np.float32)
-        # interpreter.set_tensor(input_details[0]['index'], input_data)
-
-        # interpreter.invoke()
-
-        # The function `get_tensor()` returns a copy of the tensor data.
-        # Use `tensor()` in order to get a pointer to the tensor.
-        # output_data = interpreter.get_tensor(output_details[0]['index'])
-
-        classes = loadmodel(t_img)
-
-        if classes[1] > 0.99999:  # Applying threshold
-            print("Vegetation detected with a probability: ", classes[0], '\t', "x: ", x, '\t', "y: ", y)
-            num += 1
-            savedata.append([x, y, num])
-            S = compare_images(t_img, tp)
-            scp.append(S)
-            if S > 0.5:
-                TP.append(1)
-            else:
-                FP.append(1)
-
-        else:
-            print("background with a probability: ", 1 - classes[1], '\t', "x: ", x, '\t', "y: ", y)
-            S = compare_images(t_img, tn)
-            scn.append(S)
-            if S > 0.5:
-                TN.append(1)
-            else:
-                FN.append(1)
-
-        cv2.imshow("sliding_window", resized[y:y + wind_row, x:x + wind_col])
-        cv2.imshow("Window", clone)
-        cv2.waitKey(1)
-        time.sleep(0.25)
-
-
-def compare_images(imageA, imageB):
-    return measure.compare_ssim(imageA, imageB, multichannel=True)
-
-
-# generating the sliding window
-def sliding_window(image, stepSize, windowSize):
-    for y in range(0, image.shape[0], stepSize):
-        for x in range(0, image.shape[1], stepSize):
-            yield (x, y, image[y:y + windowSize[1], x:x + windowSize[0]])
-
-
-def consfusion_matrix(TN, FN, TP, FP):
-    print("The recall of the model: ", len(TP) / (len(TP) + len(FN)))
-    print("The F1 score of the model", (2 * len(TP)) / (len(FP) + len(FN) + 2 * len(TP)))
-
+from nms import non_max_suppression_fast
+from sliding_window import pyramid, sliding_window
 
 def loadmodel(ImageT):
-
-
     img_rgb = ImageT
     #convert img to input tensor
     img_rgb = cv2.resize(img_rgb, (180, 180), cv2.INTER_AREA)
@@ -84,50 +15,109 @@ def loadmodel(ImageT):
     interpreter.set_tensor(input_details[0]['index'], img_rgb)
     interpreter.invoke()
     box = interpreter.get_tensor(output_details[0]['index'])[0]
-    return box
+    return box 
+
+# HOG parametrization
+winSize = (32,32)
+blockSize = (16,16)
+blockStride = (8,8)
+cellSize = (8,8)
+nbins = 9
+derivAperture = 1
+winSigma = -1.
+histogramNormType = 0
+L2HysThreshold = 0.2
+gammaCorrection = 1
+nlevels = 64
+useSignedGradients = True
+
+# Define HOG descriptor 
+hog = cv2.HOGDescriptor(winSize,blockSize,blockStride,
+	cellSize,nbins,derivAperture,winSigma,histogramNormType
+	,L2HysThreshold,gammaCorrection,nlevels, useSignedGradients)
+
+# Load the classifier stored in the tf-lite model
+
+interpreter = tf.lite.Interpreter(model_path="model.tflite")
+interpreter.allocate_tensors()
+
+# Get input and output tensors.
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
 
-if __name__ == '__main__':
-    savedata = []
-    ap = argparse.ArgumentParser()
-    ap.add_argument("-i", "--input", required=True,
-                    help="path to input image")
-    ap.add_argument("-n", "--name", required=True,
-                    help="name of the user")
-    args = vars(ap.parse_args())
-    # load the input image from disk
-    img = cv2.imread(args["input"])
+# Define image and Window size
+image = cv2.imread('input/centralesta.png')
+cv2.namedWindow('SlidingWindow',cv2.WINDOW_NORMAL)
+cv2.resizeWindow('SlidingWindow',(int(image.shape[1]/2),int(image.shape[0]/2)))
+# Image pyramid parameters
+scale = 2.0
+minSize = (500, 500)
+# Sliding window parameters 
+stepSize = 5
+(winW, winH) = (20, 20)
 
-    interpreter = tf.lite.Interpreter(model_path="model.tflite")
-    interpreter.allocate_tensors()
+bboxes = np.zeros(4,np.int64) # Variable to save the resulting bounding boxes
+# loop over the image pyramid
+for i, resized in enumerate(pyramid(image, scale=scale, minSize=minSize)):
+	# loop over the sliding window for each layer of the pyramid
+	for (x, y, window) in sliding_window(resized, stepSize=stepSize, windowSize=(winW, winH)):
+		# if the window does not meet our desired window size, ignore it
+		if window.shape[0] != winH or window.shape[1] != winW:
+			continue
 
-    # Get input and output tensors.
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
+		# Draw sliding Window
+		clone = resized.copy()
+		cv2.rectangle(clone, (x, y), (x + winW, y + winH), (0, 255, 0), 2)
+		
+		# Cropped the resized image using x,y,winW, winH
+		cropped_img = resized[y:y + winH, x:x + winW]
+		# Resize it so the HOG descriptor can be obtained
+		cropped_img_resized = cv2.resize(cropped_img, winSize)
+		# Compute the HOG descriptor
+		# Using the classifier predict the output of the obtained descriptor
+		y_pred = loadmodel(cropped_img_resized)
+				# Display both the Sliding window and the 
+		cv2.imshow("Sliding Window", clone)
+		cv2.imshow("Cropped", cropped_img)
+		cv2.waitKey(1)
+       
 
-    TP =[]
-    TN =[]
-    FP =[]
-    FN =[]
-    scp = []
-    scn = []
+		if y_pred[1] > 0.99999:
+			if i != 0:
+				bboxes = np.vstack((bboxes, np.array([
+					int(x*scale*i), int(y*scale*i),
+					int((x + winW)*scale*i), int((y + winH)*scale*i)])))
+			else:
+				bboxes = np.vstack((bboxes, np.array([
+					int(x),int(y),int(x + winW), int(y + winH)])))
 
-    ##Arrays for the skimage library
-    #TP=TRUE POSITVE
-    #TN=TRUE NEGATIVE
-    #FN=FALSE NEGATIVE
-    #FN=FALSE NEGATVE
-    true_positive = cv2.imread('images/class2/AV1.png')
-    true_negative = cv2.imread('images/class1/AC1.png')
-    tp = true_positive[:,:]/img.shape[0]
-    tn = true_negative[:,:]/img.shape[1]
-    resized = img# Pre-processing the image and normalize
-    wind_row, wind_col = 20,20 # dimensions of the image
-    img_rows, img_cols = 20,20
-    show_window()
-    consfusion_matrix(TN,FN,TP,FP)
-    cvsdata.datacsv(savedata,args["name"])
-    print('\t',"TN=",len(TN),'\t',"FP=",len(FP))
-    print('\t',"FN=",len(FN),'\t',"TP=",len(TP))
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+			cv2.waitKey(1500)
+
+bboxes = np.delete(bboxes, (0), axis=0)
+cv2.destroyAllWindows()
+
+img_bboxes = image.copy()
+for box in bboxes:
+	cv2.rectangle(img_bboxes, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+
+cv2.namedWindow('Bounding boxes',cv2.WINDOW_NORMAL)
+cv2.imshow('Bounding boxes', img_bboxes)
+cv2.imwrite('/output/boxes.png',img_bboxes)
+# Non maximal supression
+img_nms_bboxes = image.copy()
+nms_bboxes = non_max_suppression_fast(bboxes, 0.3)
+
+for box in nms_bboxes:
+	cv2.rectangle(img_nms_bboxes, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+
+
+
+
+cv2.namedWindow('Non maximal supression',cv2.WINDOW_NORMAL)
+cv2.imwrite('/output/nms.png',img_nms_bboxes)
+cv2.imshow('Non maximal supression', img_nms_bboxes)
+
+
+cv2.waitKey(0)
+cv2.destroyAllWindows()
